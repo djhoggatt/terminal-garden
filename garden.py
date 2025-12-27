@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse, json, os, time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 STATE_PATH = os.path.expanduser("~/.local/state/terminal-garden/garden.json")
+SPRITES_DIR = os.path.expanduser("~/.local/state/terminal-garden/sprites/pixel")  # style="pixel"
 
 SPECIES = {
     "fern": [
@@ -62,7 +63,6 @@ def render_text(st: Dict[str, Any]) -> str:
             if cell.get("plant") is not None:
                 species = cell["plant"]["species"]
                 stage = plant_stage(cell["plant"], now)
-                # Simple mapping to single-glyph for MVP
                 glyph = {
                     ("fern", "seed"): "·", ("fern", "sprout"): "˘", ("fern", "leafy"): "☘", ("fern", "mature"): "♣",
                     ("flower", "seed"): "·", ("flower", "sprout"): "˘", ("flower", "bud"): "✿", ("flower", "bloom"): "❀",
@@ -75,107 +75,192 @@ def render_text(st: Dict[str, Any]) -> str:
     out.append("+" + "-" * (w * 2) + "+")
     return "\n".join(out)
 
-# ---------- kitty/TGP render via Pillow + term-image ----------
+# ---------- deps ----------
 def _require_pil_and_term_image():
     try:
         from PIL import Image, ImageDraw
     except Exception as e:
         raise SystemExit("Missing Pillow. Install: python3 -m pip install --user pillow") from e
     try:
-        # term-image v0.7.x
         from term_image.image import AutoImage
     except Exception as e:
         raise SystemExit("Missing term-image. Install: python3 -m pip install --user term-image") from e
     return Image, ImageDraw, AutoImage
 
+# ---------- sprite cache ----------
+def sprite_path(species: str, stage: str) -> str:
+    return os.path.join(SPRITES_DIR, species, f"{stage}.png")
+
+def load_sprite(Image, species: str, stage: str) -> Optional["Image.Image"]:
+    path = sprite_path(species, stage)
+    if not os.path.exists(path):
+        return None
+    im = Image.open(path)
+    if im.mode != "RGBA":
+        im = im.convert("RGBA")
+    return im
+
+# ---------- pixel-art starter pack (generated once) ----------
+def _putpx(img, x: int, y: int, rgba: Tuple[int, int, int, int]) -> None:
+    if 0 <= x < img.size[0] and 0 <= y < img.size[1]:
+        img.putpixel((x, y), rgba)
+
+def _disk(img, cx: int, cy: int, r: int, rgba: Tuple[int, int, int, int]) -> None:
+    rr = r * r
+    for y in range(cy - r, cy + r + 1):
+        for x in range(cx - r, cx + r + 1):
+            if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= rr:
+                _putpx(img, x, y, rgba)
+
+def _line(img, x0: int, y0: int, x1: int, y1: int, rgba: Tuple[int, int, int, int]) -> None:
+    # simple Bresenham
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    x, y = x0, y0
+    while True:
+        _putpx(img, x, y, rgba)
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x += sx
+        if e2 <= dx:
+            err += dx
+            y += sy
+
+def make_sprite(Image, species: str, stage: str, size: int) -> "Image.Image":
+    # transparent sprite
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    # palette
+    soil_brown = (60, 40, 20, 255)
+    green1 = (60, 170, 80, 255)
+    green2 = (30, 120, 60, 255)
+    pink = (230, 90, 150, 255)
+    yellow = (245, 225, 90, 255)
+
+    cx, cy = size // 2, size // 2
+
+    if stage == "seed":
+        _disk(img, cx, cy + 2, max(1, size // 10), soil_brown)
+        return img
+
+    if stage == "sprout":
+        _line(img, cx, size - 3, cx, cy, green2)
+        _disk(img, cx - 2, cy - 1, max(1, size // 10), green1)
+        _disk(img, cx + 2, cy - 1, max(1, size // 10), green1)
+        return img
+
+    if species == "fern":
+        if stage in ("leafy", "mature"):
+            h = size // 2 if stage == "leafy" else (size * 2) // 3
+            _line(img, cx, size - 3, cx, size - 3 - h, green2)
+            # fronds
+            for i in range(1, 6):
+                y = size - 3 - (i * h) // 6
+                span = (i * size) // (10 if stage == "leafy" else 8)
+                _line(img, cx, y, cx - span, y - 1, green1)
+                _line(img, cx, y, cx + span, y - 1, green1)
+            return img
+
+    if species == "flower":
+        if stage == "bud":
+            _line(img, cx, size - 3, cx, cy + 2, green2)
+            _disk(img, cx, cy, max(2, size // 8), pink)
+            return img
+        if stage == "bloom":
+            _line(img, cx, size - 3, cx, cy + 2, green2)
+            pr = max(2, size // 6)
+            # petals (simple plus + diagonals)
+            for dx, dy in [(0, -pr), (pr, 0), (0, pr), (-pr, 0), (pr, -pr), (-pr, -pr)]:
+                _disk(img, cx + dx, cy + dy, pr, pink)
+            _disk(img, cx, cy, max(2, pr - 1), yellow)
+            return img
+
+    # unknown fallback (red box)
+    for x in range(size):
+        _putpx(img, x, 0, (255, 0, 0, 255))
+        _putpx(img, x, size - 1, (255, 0, 0, 255))
+    for y in range(size):
+        _putpx(img, 0, y, (255, 0, 0, 255))
+        _putpx(img, size - 1, y, (255, 0, 0, 255))
+    return img
+
+def cmd_sprites_init(args: argparse.Namespace) -> None:
+    Image, _, _ = _require_pil_and_term_image()
+    size = args.size
+    overwrite = args.overwrite
+
+    for species, stages in SPECIES.items():
+        for _, stage in stages:
+            path = sprite_path(species, stage)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if (not overwrite) and os.path.exists(path):
+                continue
+            spr = make_sprite(Image, species, stage, size)
+            spr.save(path, format="PNG")
+
+    print(f"Sprites ready in: {SPRITES_DIR}")
+    print("Replace any PNG with your own AI-generated pixel art later (keep transparency).")
+
+# ---------- kitty/TGP render via Pillow + term-image ----------
 def _colors_for_ground(ground: str) -> Tuple[int, int, int]:
-    # keep it simple + readable
     if ground == "stone":
         return (90, 90, 95)
     if ground == "path":
         return (150, 150, 150)
     return (88, 60, 35)  # soil
 
-def _draw_plant(draw, x0: int, y0: int, cell_px: int, species: str, stage: str):
-    cx = x0 + cell_px // 2
-    cy = y0 + cell_px // 2
-    r  = max(2, cell_px // 10)
-
-    # palette-ish colors
-    green = (50, 150, 70)
-    darkg = (30, 110, 50)
-    pink  = (220, 90, 140)
-    yellow= (240, 220, 80)
-
-    if stage == "seed":
-        draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=(40, 30, 20))
-        return
-
-    if stage == "sprout":
-        draw.line((cx, cy+r, cx, cy-r), fill=green, width=max(1, cell_px//16))
-        draw.ellipse((cx-r, cy-r*2, cx+r, cy), fill=green)
-        return
-
-    if species == "fern":
-        if stage in ("leafy", "mature"):
-            # simple frond strokes
-            for i in range(-2, 3):
-                draw.line((cx, cy, cx + i*(cell_px//6), cy - cell_px//3), fill=green, width=max(1, cell_px//18))
-                draw.line((cx, cy, cx + i*(cell_px//7), cy - cell_px//5), fill=darkg, width=max(1, cell_px//22))
-            return
-
-    if species == "flower":
-        if stage == "bud":
-            draw.ellipse((cx-r*2, cy-r*2, cx+r*2, cy+r*2), fill=green)
-            draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=pink)
-            return
-        if stage == "bloom":
-            # 5 petals + center
-            pr = cell_px // 4
-            for dx, dy in [(0,-pr),(pr,0),(0,pr),(-pr,0),(pr//2,-pr//2)]:
-                draw.ellipse((cx+dx-r*2, cy+dy-r*2, cx+dx+r*2, cy+dy+r*2), fill=pink)
-            draw.ellipse((cx-r*2, cy-r*2, cx+r*2, cy+r*2), fill=yellow)
-            return
-
-    # fallback
-    draw.rectangle((x0+2, y0+2, x0+cell_px-2, y0+cell_px-2), outline=(255, 0, 0), width=2)
-
 def render_kitty(st: Dict[str, Any], cell_px: int = 32, clear: bool = True) -> None:
-    Image, ImageDraw, AutoImage = _require_pil_and_term_image()
+    Image, _, AutoImage = _require_pil_and_term_image()
 
     w, h = st["width"], st["height"]
     now = int(time.time())
 
-    img_w = w * cell_px
-    img_h = h * cell_px
-    im = Image.new("RGB", (img_w, img_h), (0, 0, 0))
-    draw = ImageDraw.Draw(im)
+    # work in RGBA so we can alpha-composite sprites cleanly
+    canvas = Image.new("RGBA", (w * cell_px, h * cell_px), (0, 0, 0, 255))
 
-    # background + grid
+    # resized sprite cache for this render
+    resized: Dict[Tuple[str, str], "Image.Image"] = {}
+
     for y in range(h):
         for x in range(w):
             cell = st["cells"][idx(x, y, w)]
             ground = cell.get("ground", "soil")
             x0, y0 = x * cell_px, y * cell_px
+
+            # ground tile
             bg = _colors_for_ground(ground)
-            draw.rectangle((x0, y0, x0 + cell_px, y0 + cell_px), fill=bg)
+            tile = Image.new("RGBA", (cell_px, cell_px), (bg[0], bg[1], bg[2], 255))
+            canvas.alpha_composite(tile, (x0, y0))
 
-            # subtle grid line
-            draw.rectangle((x0, y0, x0 + cell_px, y0 + cell_px), outline=(0, 0, 0), width=1)
-
+            # plant sprite
             if cell.get("plant") is not None:
                 species = cell["plant"]["species"]
                 stage = plant_stage(cell["plant"], now)
-                _draw_plant(draw, x0, y0, cell_px, species, stage)
+                key = (species, stage)
+                spr = resized.get(key)
+                if spr is None:
+                    base = load_sprite(Image, species, stage)
+                    if base is None:
+                        # missing sprite: just skip (or you could draw a marker)
+                        spr = None
+                    else:
+                        spr = base.resize((cell_px, cell_px), resample=Image.NEAREST)
+                    resized[key] = spr  # cache None too
+                if spr is not None:
+                    canvas.alpha_composite(spr, (x0, y0))
 
     if clear:
-        # clear screen + home
         print("\x1b[2J\x1b[H", end="")
 
-    # AutoImage uses the best available protocol (Kitty on Ghostty).
-    # Print renders it at the current cursor position.
-    ti = AutoImage(im)
-    print(ti)
+    # AutoImage wants RGB nicely; flatten alpha onto black (or keep as-is if it handles RGBA)
+    out_img = canvas.convert("RGB")
+    print(AutoImage(out_img))
 
 # ---------- commands ----------
 def cmd_init(args: argparse.Namespace) -> None:
@@ -221,9 +306,14 @@ def main() -> None:
     ps.add_argument("--clear-plant", action="store_true")
     ps.set_defaults(fn=cmd_set)
 
+    psp = sp.add_parser("sprites-init")
+    psp.add_argument("--size", type=int, default=16, help="Sprite base size in pixels (recommended: 16 or 24).")
+    psp.add_argument("--overwrite", action="store_true", help="Overwrite existing PNGs.")
+    psp.set_defaults(fn=cmd_sprites_init)
+
     pv = sp.add_parser("show")
-    pv.add_argument("--kitty", action="store_true", help="Render as an image using Kitty/TGP (Ghostty supported).")
-    pv.add_argument("--cell-px", type=int, default=32, help="Pixel size per cell for --kitty.")
+    pv.add_argument("--kitty", action="store_true", help="Render as an image using Kitty/TGP.")
+    pv.add_argument("--cell-px", type=int, default=32, help="Pixel size per cell for --kitty (use multiples of sprite size).")
     pv.add_argument("--no-clear", action="store_true", help="Don't clear screen before drawing in --kitty mode.")
     pv.set_defaults(fn=cmd_show)
 
