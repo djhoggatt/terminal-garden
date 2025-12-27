@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import argparse, json, os, time
+import argparse, base64, json, os, time
+from io import BytesIO
 from typing import Dict, Any, List, Tuple, Optional
 
 STATE_PATH = os.path.expanduser("~/.local/state/terminal-garden/garden.json")
-SPRITES_DIR = os.path.expanduser("~/.local/state/terminal-garden/sprites/pixel")  # style="pixel"
+SPRITES_DIR = os.path.expanduser("~/.local/state/terminal-garden/sprites/pixel")
 
 SPECIES = {
     "fern": [
@@ -100,112 +101,12 @@ def load_sprite(Image, species: str, stage: str) -> Optional["Image.Image"]:
         im = im.convert("RGBA")
     return im
 
-# ---------- pixel-art starter pack (generated once) ----------
-def _putpx(img, x: int, y: int, rgba: Tuple[int, int, int, int]) -> None:
-    if 0 <= x < img.size[0] and 0 <= y < img.size[1]:
-        img.putpixel((x, y), rgba)
-
-def _disk(img, cx: int, cy: int, r: int, rgba: Tuple[int, int, int, int]) -> None:
-    rr = r * r
-    for y in range(cy - r, cy + r + 1):
-        for x in range(cx - r, cx + r + 1):
-            if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= rr:
-                _putpx(img, x, y, rgba)
-
-def _line(img, x0: int, y0: int, x1: int, y1: int, rgba: Tuple[int, int, int, int]) -> None:
-    # simple Bresenham
-    dx = abs(x1 - x0)
-    dy = -abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx + dy
-    x, y = x0, y0
-    while True:
-        _putpx(img, x, y, rgba)
-        if x == x1 and y == y1:
-            break
-        e2 = 2 * err
-        if e2 >= dy:
-            err += dy
-            x += sx
-        if e2 <= dx:
-            err += dx
-            y += sy
-
-def make_sprite(Image, species: str, stage: str, size: int) -> "Image.Image":
-    # transparent sprite
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-
-    # palette
-    soil_brown = (60, 40, 20, 255)
-    green1 = (60, 170, 80, 255)
-    green2 = (30, 120, 60, 255)
-    pink = (230, 90, 150, 255)
-    yellow = (245, 225, 90, 255)
-
-    cx, cy = size // 2, size // 2
-
-    if stage == "seed":
-        _disk(img, cx, cy + 2, max(1, size // 10), soil_brown)
-        return img
-
-    if stage == "sprout":
-        _line(img, cx, size - 3, cx, cy, green2)
-        _disk(img, cx - 2, cy - 1, max(1, size // 10), green1)
-        _disk(img, cx + 2, cy - 1, max(1, size // 10), green1)
-        return img
-
-    if species == "fern":
-        if stage in ("leafy", "mature"):
-            h = size // 2 if stage == "leafy" else (size * 2) // 3
-            _line(img, cx, size - 3, cx, size - 3 - h, green2)
-            # fronds
-            for i in range(1, 6):
-                y = size - 3 - (i * h) // 6
-                span = (i * size) // (10 if stage == "leafy" else 8)
-                _line(img, cx, y, cx - span, y - 1, green1)
-                _line(img, cx, y, cx + span, y - 1, green1)
-            return img
-
-    if species == "flower":
-        if stage == "bud":
-            _line(img, cx, size - 3, cx, cy + 2, green2)
-            _disk(img, cx, cy, max(2, size // 8), pink)
-            return img
-        if stage == "bloom":
-            _line(img, cx, size - 3, cx, cy + 2, green2)
-            pr = max(2, size // 6)
-            # petals (simple plus + diagonals)
-            for dx, dy in [(0, -pr), (pr, 0), (0, pr), (-pr, 0), (pr, -pr), (-pr, -pr)]:
-                _disk(img, cx + dx, cy + dy, pr, pink)
-            _disk(img, cx, cy, max(2, pr - 1), yellow)
-            return img
-
-    # unknown fallback (red box)
-    for x in range(size):
-        _putpx(img, x, 0, (255, 0, 0, 255))
-        _putpx(img, x, size - 1, (255, 0, 0, 255))
-    for y in range(size):
-        _putpx(img, 0, y, (255, 0, 0, 255))
-        _putpx(img, size - 1, y, (255, 0, 0, 255))
-    return img
-
-def cmd_sprites_init(args: argparse.Namespace) -> None:
-    Image, _, _ = _require_pil_and_term_image()
-    size = args.size
-    overwrite = args.overwrite
-
-    for species, stages in SPECIES.items():
-        for _, stage in stages:
-            path = sprite_path(species, stage)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if (not overwrite) and os.path.exists(path):
-                continue
-            spr = make_sprite(Image, species, stage, size)
-            spr.save(path, format="PNG")
-
-    print(f"Sprites ready in: {SPRITES_DIR}")
-    print("Replace any PNG with your own AI-generated pixel art later (keep transparency).")
+def list_required_sprites() -> List[Tuple[str, str]]:
+    req: List[Tuple[str, str]] = []
+    for sp, stages in SPECIES.items():
+        for _, st in stages:
+            req.append((sp, st))
+    return req
 
 # ---------- kitty/TGP render via Pillow + term-image ----------
 def _colors_for_ground(ground: str) -> Tuple[int, int, int]:
@@ -221,11 +122,8 @@ def render_kitty(st: Dict[str, Any], cell_px: int = 32, clear: bool = True) -> N
     w, h = st["width"], st["height"]
     now = int(time.time())
 
-    # work in RGBA so we can alpha-composite sprites cleanly
     canvas = Image.new("RGBA", (w * cell_px, h * cell_px), (0, 0, 0, 255))
-
-    # resized sprite cache for this render
-    resized: Dict[Tuple[str, str], "Image.Image"] = {}
+    resized: Dict[Tuple[str, str], Optional["Image.Image"]] = {}
 
     for y in range(h):
         for x in range(w):
@@ -233,34 +131,134 @@ def render_kitty(st: Dict[str, Any], cell_px: int = 32, clear: bool = True) -> N
             ground = cell.get("ground", "soil")
             x0, y0 = x * cell_px, y * cell_px
 
-            # ground tile
             bg = _colors_for_ground(ground)
             tile = Image.new("RGBA", (cell_px, cell_px), (bg[0], bg[1], bg[2], 255))
             canvas.alpha_composite(tile, (x0, y0))
 
-            # plant sprite
             if cell.get("plant") is not None:
                 species = cell["plant"]["species"]
                 stage = plant_stage(cell["plant"], now)
                 key = (species, stage)
-                spr = resized.get(key)
-                if spr is None:
+
+                spr = resized.get(key, None)
+                if key not in resized:
                     base = load_sprite(Image, species, stage)
                     if base is None:
-                        # missing sprite: just skip (or you could draw a marker)
                         spr = None
                     else:
                         spr = base.resize((cell_px, cell_px), resample=Image.NEAREST)
-                    resized[key] = spr  # cache None too
+                    resized[key] = spr
+
                 if spr is not None:
                     canvas.alpha_composite(spr, (x0, y0))
 
     if clear:
         print("\x1b[2J\x1b[H", end="")
 
-    # AutoImage wants RGB nicely; flatten alpha onto black (or keep as-is if it handles RGBA)
-    out_img = canvas.convert("RGB")
-    print(AutoImage(out_img))
+    print(AutoImage(canvas.convert("RGB")))
+
+# ---------- AI sprite generation (OpenAI Images API) ----------
+def _require_openai_client():
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        raise SystemExit("Missing openai. Install: python3 -m pip install --user openai") from e
+    return OpenAI
+
+def sprite_prompt(style: str, species: str, stage: str, sprite_px: int) -> str:
+    # Keep this prompt stable so all sprites match.
+    # The API will generate a large image; we'll downscale to sprite_px.
+    return f"""
+Create a single pixel-art SPRITE for a terminal garden game.
+
+STYLE:
+- Pixel-art, clean, crisp, limited palette (<= 16 colors).
+- 1px outline where appropriate.
+- No text, no border, no shadow drop.
+- Centered subject, fits fully inside the frame with a little padding.
+- Transparent background (alpha).
+
+SUBJECT:
+- Species: {species}
+- Growth stage: {stage}
+
+FRAMING:
+- Single object only (the plant), no ground tile, no pot, no UI elements.
+- Sprite should still read well when downscaled to {sprite_px}x{sprite_px}.
+
+Overall art direction: {style}
+""".strip()
+
+def generate_sprite_openai(species: str, stage: str, out_path: str, sprite_px: int,
+                           model: str, quality: str, style: str) -> None:
+    Image, _, _ = _require_pil_and_term_image()
+    OpenAI = _require_openai_client()
+
+    client = OpenAI()
+    prompt = sprite_prompt(style=style, species=species, stage=stage, sprite_px=sprite_px)
+
+    # GPT Image models return base64-encoded image data (b64_json). :contentReference[oaicite:3]{index=3}
+    result = client.images.generate(
+        model=model,
+        prompt=prompt,
+        size="1024x1024",
+        quality=quality,
+        output_format="png",
+        background="transparent",
+    )
+
+    img_b64 = result.data[0].b64_json
+    img_bytes = base64.b64decode(img_b64)
+
+    im = Image.open(BytesIO(img_bytes)).convert("RGBA")
+    # Downscale to sprite resolution with nearest-neighbor to preserve the pixel look
+    im = im.resize((sprite_px, sprite_px), resample=Image.NEAREST)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    im.save(out_path, format="PNG")
+
+def cmd_sprites_generate(args: argparse.Namespace) -> None:
+    req = list_required_sprites()
+    todo: List[Tuple[str, str, str]] = []
+    for species, stage in req:
+        path = sprite_path(species, stage)
+        if args.overwrite or (not os.path.exists(path)):
+            todo.append((species, stage, path))
+
+    if args.only:
+        # args.only is a list like ["fern:leafy", "flower:bloom"]
+        wanted = set(args.only)
+        todo = [(sp, st, p) for (sp, st, p) in todo if f"{sp}:{st}" in wanted]
+
+    if not todo:
+        print("No sprites to generate (everything present).")
+        return
+
+    if args.dry_run:
+        print("Would generate:")
+        for sp, st, p in todo:
+            print(f"  {sp}:{st} -> {p}")
+        return
+
+    print(f"Generating {len(todo)} sprites into: {SPRITES_DIR}")
+    for i, (sp, st, p) in enumerate(todo, 1):
+        print(f"[{i}/{len(todo)}] {sp}:{st}")
+        try:
+            generate_sprite_openai(
+                species=sp,
+                stage=st,
+                out_path=p,
+                sprite_px=args.sprite_px,
+                model=args.model,
+                quality=args.quality,
+                style=args.style,
+            )
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            if args.fail_fast:
+                raise SystemExit(1)
+
+    print("Done.")
 
 # ---------- commands ----------
 def cmd_init(args: argparse.Namespace) -> None:
@@ -306,16 +304,30 @@ def main() -> None:
     ps.add_argument("--clear-plant", action="store_true")
     ps.set_defaults(fn=cmd_set)
 
-    psp = sp.add_parser("sprites-init")
-    psp.add_argument("--size", type=int, default=16, help="Sprite base size in pixels (recommended: 16 or 24).")
-    psp.add_argument("--overwrite", action="store_true", help="Overwrite existing PNGs.")
-    psp.set_defaults(fn=cmd_sprites_init)
-
     pv = sp.add_parser("show")
     pv.add_argument("--kitty", action="store_true", help="Render as an image using Kitty/TGP.")
-    pv.add_argument("--cell-px", type=int, default=32, help="Pixel size per cell for --kitty (use multiples of sprite size).")
+    pv.add_argument("--cell-px", type=int, default=32, help="Pixel size per cell for --kitty.")
     pv.add_argument("--no-clear", action="store_true", help="Don't clear screen before drawing in --kitty mode.")
     pv.set_defaults(fn=cmd_show)
+
+    pg = sp.add_parser("sprites-generate")
+    pg.add_argument("--model", default="gpt-image-1", help="OpenAI image model (e.g., gpt-image-1).")
+    pg.add_argument("--quality", default="low", choices=["low", "medium", "high", "auto"], help="Lower is cheaper + more sprite-like.")
+    pg.add_argument("--sprite-px", type=int, default=16, help="Final sprite resolution (e.g., 16).")
+    pg.add_argument("--overwrite", action="store_true", help="Regenerate sprites even if PNGs exist.")
+    pg.add_argument("--dry-run", action="store_true", help="List what would be generated, then exit.")
+    pg.add_argument("--fail-fast", action="store_true", help="Stop on first API error.")
+    pg.add_argument(
+        "--only",
+        nargs="*",
+        help='Generate only specific sprites, like: --only fern:leafy flower:bloom',
+    )
+    pg.add_argument(
+        "--style",
+        default="Cozy garden sprites. Consistent palette and silhouette language across all stages.",
+        help="Global art-direction string to keep the set consistent.",
+    )
+    pg.set_defaults(fn=cmd_sprites_generate)
 
     args = p.parse_args()
     args.fn(args)
